@@ -42,3 +42,4 @@ def home():
                                                                                                                             "total": len(lista_empresas),
                                                                                                                                     "empresas": lista_empresas
                                                                                                                                         }
+handler = app
