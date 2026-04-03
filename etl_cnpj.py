@@ -135,12 +135,10 @@ def main():
         ).drop(["tipo_logradouro", "logradouro", "numero"])
 
         print(f"Salvando {len(resultado)} registros no SQLite...")
-        conn = sqlite3.connect('data/prospeccao.db')
+        conn = sqlite3.connectto('api/prospeccao.db')
         resultado.to_pandas().to_sql('empresas_alvo', conn, if_exists='replace', index=False)
         conn.close()
         print("Sucesso!")
 
 if __name__ == "__main__":
-    if not os.path.exists('data'):
-        os.makedirs('data')
     main()
