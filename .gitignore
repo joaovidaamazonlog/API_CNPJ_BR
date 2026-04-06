@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.env
+
+# Zips temporários do ETL
+data/*.zip
+
+# O banco data/prospeccao.db deve ser commitado — a Vercel lê ele como arquivo estático
+# Se ultrapassar 100MB, habilite Git LFS: git lfs track "data/*.db"

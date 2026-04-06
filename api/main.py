@@ -4,42 +4,38 @@ import os
 
 app = FastAPI()
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, '/prospeccao.db')
+# Na Vercel, funções serverless rodam com cwd na raiz do projeto.
+# Usamos caminho relativo ao cwd, com fallback para relativo ao __file__.
+def _db_path():
+    # Tenta relativo ao cwd (funciona na Vercel e localmente na raiz)
+    p = os.path.join(os.getcwd(), "data", "prospeccao.db")
+    if os.path.exists(p):
+        return p
+    # Fallback: relativo ao diretório do arquivo (útil em dev fora da raiz)
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "prospeccao.db")
 
-@app.get("/api/buscar")
-def home():
+@app.get("/api")
+def status():
     return {"status": "API de Prospecção Ativa", "versao": "1.0"}
 
-@app.get("/buscar")
+@app.get("/api/buscar")
 def buscar_por_cep(cep: str):
-    # Verifica se o arquivo do banco existe
-    if not os.path.exists(DB_PATH):
-        raise HTTPException(status_code=500, detail="Banco de dados não encontrado.")
-                
-        # Remove traços do CEP caso o usuário envie "01001-000"
-        cep_limpo = cep.replace("-", "").strip()
+    db_path = _db_path()
+    if not os.path.exists(db_path):
+        raise HTTPException(status_code=500, detail=f"Banco de dados não encontrado em {db_path}.")
 
-        # Conecta no SQLite
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row # Faz o SQLite retornar os dados como um dicionário (JSON)
-        cursor = conn.cursor()
-                                            
-        # Executa a busca no banco
-        # IMPORTANTE: A tabela tem que ter o mesmo nome que você definiu no script de ETL (empresas_alvo)
-        cursor.execute("SELECT * FROM empresas_alvo WHERE cep = ?", (cep_limpo,))
-        resultados = cursor.fetchall()
-        conn.close()
-                                                                    
-        # Se não achar nada, retorna lista vazia
-        if not resultados:
-            return {"total": 0, "empresas": []}
-                                                                                            
-        # Converte os resultados para uma lista pronta para ser enviada
-        lista_empresas = [dict(row) for row in resultados]
-                                                                                                            
+    cep_limpo = cep.replace("-", "").strip()
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM empresas_alvo WHERE cep = ?", (cep_limpo,))
+    resultados = cursor.fetchall()
+    conn.close()
+
     return {
-        "total": len(lista_empresas),
-        "empresas": lista_empresas
+        "total": len(resultados),
+        "empresas": [dict(row) for row in resultados],
     }
+
 handler = app

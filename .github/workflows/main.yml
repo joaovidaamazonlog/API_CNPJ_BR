@@ -2,32 +2,50 @@ name: Atualizar Base de Prospecção
 
 on:
   schedule:
-    - cron: '0 0 1 * *' # Roda à meia-noite do dia 1 de cada mês
+    # Roda dia 15 de cada mês às 02h UTC
+    # Os dados do mês anterior ficam disponíveis geralmente na 2ª semana
+    - cron: '0 2 15 * *'
   workflow_dispatch: # Permite rodar manualmente pelo painel do GitHub
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: write # necessário para o git push
+
     steps:
       - name: Checkout do código
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+
+      - name: Liberar espaço em disco
+        # Remove ferramentas desnecessárias do runner para ganhar ~10 GB
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h
 
       - name: Configurar Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Instalar dependências
-        run: |
-          pip install requests polars pandas
+        run: pip install requests polars==1.19.0 connectorx==0.3.3
 
       - name: Executar Script ETL
         run: python etl_cnpj.py
 
+      - name: Verificar tamanho do banco gerado
+        run: |
+          ls -lh data/prospeccao.db || echo "Banco não gerado"
+          df -h
+
       - name: Commit e Push do Banco de Dados
         run: |
-          git config --global user.name "Bot de Dados"
-          git config --global user.email "bot@github.com"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add data/prospeccao.db
-          git commit -m "Atualização mensal dos dados da Receita" || exit 0
+          git commit -m "chore: atualização mensal dos dados da Receita Federal" || echo "Sem alterações para commitar"
           git push

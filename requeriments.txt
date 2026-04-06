@@ -1,10 +1,9 @@
-# --- Bibliotecas para o ETL (GitHub Actions) ---
+# --- ETL (GitHub Actions apenas) ---
 requests==2.31.0
-polars==0.20.15
-pandas==2.2.1
+polars==1.19.0
+connectorx==0.3.3
 
-# --- Bibliotecas para a API (Vercel) ---
+# --- API (Vercel) ---
 fastapi==0.110.0
 uvicorn==0.27.1
 pydantic==2.6.3
-
