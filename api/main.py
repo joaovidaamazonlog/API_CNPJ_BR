@@ -10,21 +10,32 @@ POST /api/empresas               — busca unificada (Receita Federal + Maps) po
 POST /api/empresas/contactada    — toggle de empresa contactada (qualquer fonte)
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import libsql_client
 import os
-import asyncio
 
 app = FastAPI()
 
+ALLOWED_ORIGIN = "https://joaovidaamazonlog.github.io"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://joaovidaamazonlog.github.io"],
+    allow_origins=[ALLOWED_ORIGIN],
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type"],
 )
+
+# Garante headers CORS mesmo em erros 500
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+        headers={"Access-Control-Allow-Origin": ALLOWED_ORIGIN},
+    )
 
 # ---------------------------------------------------------------------------
 # Conexão Turso
@@ -44,11 +55,11 @@ class BuscarEmpresasRequest(BaseModel):
     territory_id: str | None = None
 
 class ContactadaRequest(BaseModel):
-    lead_key:    str          # link Maps ou "nome|endereço"
-    lead_nome:   str  = ""
-    territorio:  str  = ""
-    fonte:       str  = ""    # "maps" | "receita"
-    action:      str  = "add" # "add" | "remove"
+    lead_key:   str
+    lead_nome:  str  = ""
+    territorio: str  = ""
+    fonte:      str  = ""
+    action:     str  = "add"  # "add" | "remove"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -68,18 +79,14 @@ def status():
 
 @app.post("/api/empresas")
 def buscar_empresas(body: BuscarEmpresasRequest):
-    """
-    Busca unificada: retorna empresas da Receita Federal (por CEP)
-    e do Google Maps (por territory_id), com flag 'contactada' em cada uma.
-    """
     ceps_limpos = _limpar_ceps(body.ceps)
 
     with _get_client() as client:
-        # ── 1. Leads contactados (para aplicar flag) ──────────────────────
+        # Leads contactados
         rs = client.execute("SELECT lead_key FROM leads_contactados")
         contactadas = {row[0] for row in rs.rows}
 
-        # ── 2. Receita Federal — busca por CEP ────────────────────────────
+        # Receita Federal — por CEP
         receita = []
         if ceps_limpos:
             placeholders = ",".join("?" * len(ceps_limpos))
@@ -90,12 +97,14 @@ def buscar_empresas(body: BuscarEmpresasRequest):
             cols = [d[0] for d in rs.columns] if rs.columns else []
             for row in rs.rows:
                 emp = dict(zip(cols, row))
-                key = emp.get("cnpj_basico", "") + "|" + emp.get("endereco", "")
-                emp["fonte"]       = "Receita Federal"
-                emp["contactada"]  = key in contactadas or _any_key_match(emp, contactadas)
+                nome     = emp.get("razao_social", "") or emp.get("nome_fantasia", "")
+                endereco = emp.get("endereco", "")
+                key      = f"{nome}|{endereco}"
+                emp["fonte"]      = "Receita Federal"
+                emp["contactada"] = key in contactadas
                 receita.append(emp)
 
-        # ── 3. Google Maps — busca por territory_id ───────────────────────
+        # Google Maps — por territory_id
         maps = []
         if body.territory_id:
             rs = client.execute(
@@ -111,20 +120,15 @@ def buscar_empresas(body: BuscarEmpresasRequest):
                 maps.append(emp)
 
     empresas = receita + maps
-    return {
-        "total":    len(empresas),
-        "empresas": empresas,
-    }
+    return {"total": len(empresas), "empresas": empresas}
 
 
 @app.post("/api/empresas/contactada")
 def toggle_contactada(body: ContactadaRequest):
-    """Toggle de empresa contactada — funciona para Maps e Receita Federal."""
     if not body.lead_key:
         raise HTTPException(status_code=422, detail="lead_key é obrigatório")
 
     with _get_client() as client:
-        # Garantir que a tabela existe
         client.execute("""
             CREATE TABLE IF NOT EXISTS leads_contactados (
                 lead_key   TEXT PRIMARY KEY,
@@ -140,32 +144,19 @@ def toggle_contactada(body: ContactadaRequest):
                 "DELETE FROM leads_contactados WHERE lead_key = ?",
                 [body.lead_key],
             )
-            return {"ok": True, "action": "removed", "lead_key": body.lead_key}
+            return {"ok": True, "action": "removed"}
         else:
             client.execute(
-                """
-                INSERT INTO leads_contactados (lead_key, lead_nome, territorio, fonte)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(lead_key) DO UPDATE SET
-                    lead_nome  = excluded.lead_nome,
-                    territorio = excluded.territorio,
-                    fonte      = excluded.fonte,
-                    saved_at   = datetime('now')
-                """,
+                """INSERT INTO leads_contactados (lead_key, lead_nome, territorio, fonte)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(lead_key) DO UPDATE SET
+                       lead_nome  = excluded.lead_nome,
+                       territorio = excluded.territorio,
+                       fonte      = excluded.fonte,
+                       saved_at   = datetime('now')""",
                 [body.lead_key, body.lead_nome, body.territorio, body.fonte],
             )
-            return {"ok": True, "action": "saved", "lead_key": body.lead_key}
-
-
-# ---------------------------------------------------------------------------
-# Helper interno
-# ---------------------------------------------------------------------------
-
-def _any_key_match(emp: dict, contactadas: set) -> bool:
-    """Tenta múltiplas chaves possíveis para empresas da Receita Federal."""
-    nome     = emp.get("razao_social", "") or emp.get("nome_fantasia", "")
-    endereco = emp.get("endereco", "")
-    return f"{nome}|{endereco}" in contactadas
+            return {"ok": True, "action": "saved"}
 
 
 handler = app
