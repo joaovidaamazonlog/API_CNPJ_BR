@@ -2,7 +2,6 @@
 api/main.py
 ===========
 API de Prospecção — usa Turso HTTP API diretamente via httpx.
-Sem SDK libsql, sem problemas de WebSocket ou versão.
 """
 
 from fastapi import FastAPI, HTTPException, Request
@@ -49,10 +48,7 @@ def _arg(v):
     return {"type": "text", "value": str(v)}
 
 def turso_execute(sql: str, args: list = []) -> list[dict]:
-    """Executa uma query no Turso e retorna lista de dicts."""
-    url   = f"{_turso_url()}/v2/pipeline"
-    token = _turso_token()
-
+    """Executa uma query no Turso e retorna lista de dicts. Retorna [] em caso de erro."""
     payload = {
         "requests": [
             {"type": "execute", "stmt": {"sql": sql, "args": [_arg(a) for a in args]}},
@@ -60,28 +56,35 @@ def turso_execute(sql: str, args: list = []) -> list[dict]:
         ]
     }
 
-    with httpx.Client(timeout=10) as client:
+    with httpx.Client(timeout=15) as client:
         res = client.post(
-            url,
+            f"{_turso_url()}/v2/pipeline",
             json=payload,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {_turso_token()}",
+                "Content-Type": "application/json",
+            },
         )
 
     if res.status_code != 200:
-        raise Exception(f"Turso HTTP {res.status_code}: {res.text}")
+        raise Exception(f"Turso HTTP {res.status_code}: {res.text[:200]}")
 
-    data     = res.json()
-    result   = data["results"][0]
+    data   = res.json()
+    result = data["results"][0]
 
+    # Erro na query (ex: tabela não existe) — retorna lista vazia
     if result.get("type") == "error":
-        raise Exception(f"Turso error: {result.get('error')}")
+        return []
 
-    cols = [c["name"] for c in result["response"]["result"]["cols"]]
-    rows = result["response"]["result"]["rows"]
+    inner = result.get("response", {}).get("result", {})
+    cols  = [c["name"] for c in inner.get("cols", [])]
+    rows  = inner.get("rows", [])
 
     return [
-        {cols[i]: (cell.get("value") if cell.get("type") != "null" else None)
-         for i, cell in enumerate(row)}
+        {
+            cols[i]: (cell.get("value") if cell.get("type") != "null" else None)
+            for i, cell in enumerate(row)
+        }
         for row in rows
     ]
 
@@ -120,12 +123,9 @@ def status():
 def buscar_empresas(body: BuscarEmpresasRequest):
     ceps_limpos = _limpar_ceps(body.ceps)
 
-    # Leads contactados
-    try:
-        rows = turso_execute("SELECT lead_key FROM leads_contactados")
-        contactadas = {r["lead_key"] for r in rows}
-    except Exception:
-        contactadas = set()
+    # Leads contactados — retorna [] se tabela não existir ainda
+    rows       = turso_execute("SELECT lead_key FROM leads_contactados")
+    contactadas = {r["lead_key"] for r in rows}
 
     # Receita Federal — por CEP
     receita = []
@@ -138,9 +138,8 @@ def buscar_empresas(body: BuscarEmpresasRequest):
         for emp in rows:
             nome     = emp.get("razao_social") or emp.get("nome_fantasia") or ""
             endereco = emp.get("endereco") or ""
-            key      = f"{nome}|{endereco}"
             emp["fonte"]      = "Receita Federal"
-            emp["contactada"] = key in contactadas
+            emp["contactada"] = f"{nome}|{endereco}" in contactadas
             receita.append(emp)
 
     # Google Maps — por territory_id
@@ -165,7 +164,7 @@ def toggle_contactada(body: ContactadaRequest):
     if not body.lead_key:
         raise HTTPException(status_code=422, detail="lead_key é obrigatório")
 
-    # Garantir tabela existe
+    # Criar tabela se não existir
     turso_execute("""
         CREATE TABLE IF NOT EXISTS leads_contactados (
             lead_key   TEXT PRIMARY KEY,
@@ -182,18 +181,18 @@ def toggle_contactada(body: ContactadaRequest):
             [body.lead_key],
         )
         return {"ok": True, "action": "removed"}
-    else:
-        turso_execute(
-            """INSERT INTO leads_contactados (lead_key, lead_nome, territorio, fonte)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(lead_key) DO UPDATE SET
-                   lead_nome  = excluded.lead_nome,
-                   territorio = excluded.territorio,
-                   fonte      = excluded.fonte,
-                   saved_at   = datetime('now')""",
-            [body.lead_key, body.lead_nome, body.territorio, body.fonte],
-        )
-        return {"ok": True, "action": "saved"}
+
+    turso_execute(
+        """INSERT INTO leads_contactados (lead_key, lead_nome, territorio, fonte)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(lead_key) DO UPDATE SET
+               lead_nome  = excluded.lead_nome,
+               territorio = excluded.territorio,
+               fonte      = excluded.fonte,
+               saved_at   = datetime('now')""",
+        [body.lead_key, body.lead_nome, body.territorio, body.fonte],
+    )
+    return {"ok": True, "action": "saved"}
 
 
 handler = app
