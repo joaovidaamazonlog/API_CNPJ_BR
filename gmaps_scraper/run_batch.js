@@ -1,7 +1,8 @@
 /**
  * run_batch.js
  * ============
- * Scraping do Google Maps — grava resultados no Turso (libsql).
+ * Scraping do Google Maps — grava resultados no Turso.
+ * Usa @tursodatabase/serverless (sem dependências nativas).
  *
  * Busca ideal_supply.json e territories_index.json via GitHub Pages do atlas.
  *
@@ -11,7 +12,7 @@
  */
 
 const { scrapeGmaps, closeSharedBrowser } = require('./scraper');
-const { createClient } = require('@libsql/client');
+const { createClient } = require('@tursodatabase/serverless');
 
 // ---------------------------------------------------------------------------
 // CONFIGURAÇÃO
@@ -25,7 +26,7 @@ const BUSINESS_TYPES = [
     'disk agua e gas',
 ];
 
-const ATLAS_BASE_URL   = 'https://joaovidaamazonlog.github.io/atlas/output_data';
+const ATLAS_BASE_URL    = 'https://joaovidaamazonlog.github.io/atlas/output_data';
 const BATCH_CONCURRENCY = 5;
 const DELAY_MS          = 1000;
 
@@ -63,11 +64,6 @@ async function ensureTable(client) {
     `);
 }
 
-/**
- * Upsert de um lead no Turso.
- * Usa google_maps_link como chave única quando disponível,
- * caso contrário usa nome + territory_id.
- */
 async function upsertLead(client, item) {
     if (item.google_maps_link && item.google_maps_link !== 'N/A') {
         await client.execute({
@@ -75,13 +71,13 @@ async function upsertLead(client, item) {
                     (nome, endereco, telefone, site, google_maps_link, lat, lon, tipo, territory_id, station_code, cep, updated_at)
                   VALUES (?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
                   ON CONFLICT(google_maps_link) DO UPDATE SET
-                    nome         = excluded.nome,
-                    endereco     = CASE WHEN excluded.endereco != 'N/A' THEN excluded.endereco ELSE gmaps_leads.endereco END,
-                    telefone     = excluded.telefone,
-                    lat          = excluded.lat,
-                    lon          = excluded.lon,
-                    cep          = excluded.cep,
-                    updated_at   = datetime('now')`,
+                    nome       = excluded.nome,
+                    endereco   = CASE WHEN excluded.endereco != 'N/A' THEN excluded.endereco ELSE gmaps_leads.endereco END,
+                    telefone   = excluded.telefone,
+                    lat        = excluded.lat,
+                    lon        = excluded.lon,
+                    cep        = excluded.cep,
+                    updated_at = datetime('now')`,
             args: [
                 item.nome, item.endereco, item.telefone, item.site,
                 item.google_maps_link, item.lat, item.lon,
@@ -89,7 +85,6 @@ async function upsertLead(client, item) {
             ],
         });
     } else {
-        // Sem link único — insert apenas se não existir pelo nome+território
         await client.execute({
             sql: `INSERT OR IGNORE INTO gmaps_leads
                     (nome, endereco, telefone, site, google_maps_link, lat, lon, tipo, territory_id, station_code, cep)
@@ -157,7 +152,6 @@ async function main() {
         fetchJson(`${ATLAS_BASE_URL}/territories_index.json`),
     ]);
 
-    // Coletar territórios com slots em aberto
     const openTerritories = new Set();
     for (const [tid, slots] of Object.entries(idealSupply.slots || {})) {
         const hasOpen = slots.some(s => !s.matched_partner_id);
@@ -193,7 +187,7 @@ async function main() {
         try {
             const items = await scrapeGmaps(type, String(meta.centroid_lat), String(meta.centroid_lon));
             for (const item of items) {
-                const lead = {
+                await upsertLead(client, {
                     nome:             item.name    || 'N/A',
                     endereco:         item.address || 'N/A',
                     telefone:         item.phone   || 'N/A',
@@ -205,8 +199,7 @@ async function main() {
                     territory_id:     tid,
                     station_code:     meta.station_code,
                     cep:              item.cep || extractCep(item.address),
-                };
-                await upsertLead(client, lead);
+                });
             }
             console.log(`    → ${items.length} empresas processadas`);
         } catch (err) {
