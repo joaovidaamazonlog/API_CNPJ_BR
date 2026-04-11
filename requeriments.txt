@@ -1,7 +1,9 @@
-# --- ETL (GitHub Actions apenas) ---
+# --- ETL (GitHub Actions) ---
 requests==2.31.0
-polars==1.19.0
-connectorx==0.3.3
+libsql-experimental==0.0.37
+
+# --- Scraper GMaps (GitHub Actions) ---
+# libsql-experimental já incluso acima
 
 # --- API (Vercel) ---
 fastapi==0.110.0

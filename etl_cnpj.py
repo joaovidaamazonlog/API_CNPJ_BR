@@ -1,16 +1,15 @@
 import requests
-import polars as pl
 import zipfile
 import io
 import csv
 import os
 import re
-import sqlite3
 import tempfile
 import time
 import threading
 import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import libsql
 
 # =============================================================================
 # Configurações de Filtro
@@ -224,31 +223,89 @@ def _processar_parte_estab(token, period, empresas, i, write_queue):
     if matched:
         write_queue.put(matched)
 
-def _thread_escritora(write_queue, db_path):
+_CREATE_TABLE = """
+CREATE TABLE IF NOT EXISTS empresas_alvo (
+    cnpj_basico      TEXT,
+    cnpj_ordem       TEXT,
+    cnpj_dv          TEXT,
+    razao_social     TEXT,
+    nome_fantasia    TEXT,
+    porte            TEXT,
+    cnae_principal   TEXT,
+    cnae_secundaria  TEXT,
+    endereco         TEXT,
+    bairro           TEXT,
+    cep              TEXT,
+    uf               TEXT,
+    telefone_1       TEXT,
+    telefone_2       TEXT,
+    email            TEXT,
+    contactada       INTEGER DEFAULT 0,
+    PRIMARY KEY (cnpj_basico, cnpj_ordem, cnpj_dv)
+)
+"""
+
+_UPSERT = """
+INSERT INTO empresas_alvo
+    (cnpj_basico, cnpj_ordem, cnpj_dv, razao_social, nome_fantasia, porte,
+     cnae_principal, cnae_secundaria, endereco, bairro, cep, uf,
+     telefone_1, telefone_2, email)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(cnpj_basico, cnpj_ordem, cnpj_dv) DO UPDATE SET
+    razao_social    = excluded.razao_social,
+    nome_fantasia   = excluded.nome_fantasia,
+    porte           = excluded.porte,
+    cnae_principal  = excluded.cnae_principal,
+    cnae_secundaria = excluded.cnae_secundaria,
+    endereco        = excluded.endereco,
+    bairro          = excluded.bairro,
+    cep             = excluded.cep,
+    uf              = excluded.uf,
+    telefone_1      = excluded.telefone_1,
+    telefone_2      = excluded.telefone_2,
+    email           = excluded.email
+"""
+
+
+def _get_turso_conn():
+    return libsql.connect(
+        ":memory:",
+        sync_url=os.environ["TURSO_URL"],
+        auth_token=os.environ["TURSO_TOKEN"],
+    )
+
+
+def _thread_escritora(write_queue):
     """
-    Thread dedicada à escrita no SQLite.
+    Thread dedicada à escrita no Turso.
     Consome a fila e insere em batches — uma thread só, sem conflito de lock.
     """
-    conn = sqlite3.connect(db_path)
-    tabela_criada = False
+    conn = _get_turso_conn()
+    conn.sync()
+    conn.execute(_CREATE_TABLE)
+    conn.commit()
+    conn.sync()
+
     total = 0
 
     while True:
         batch = write_queue.get()
         if batch is _SENTINEL:
             break
-        df = pl.DataFrame(batch)
-        df.write_database(
-            table_name="empresas_alvo",
-            connection=f"sqlite:///{db_path}",
-            if_table_exists="replace" if not tabela_criada else "append",
-        )
-        tabela_criada = True
+        for row in batch:
+            conn.execute(_UPSERT, (
+                row["cnpj_basico"], row["cnpj_ordem"], row["cnpj_dv"],
+                row["razao_social"], row["nome_fantasia"], row["porte"],
+                row["cnae_principal"], row["cnae_secundaria"],
+                row["endereco"], row["bairro"], row["cep"], row["uf"],
+                row["telefone_1"], row["telefone_2"], row["email"],
+            ))
+        conn.commit()
+        conn.sync()
         total += len(batch)
         log(f"  [DB] {len(batch)} registros gravados | total: {total}")
         write_queue.task_done()
 
-    conn.close()
     log(f"  [DB] Escrita concluída — {total} registros no total")
 
 def main():
@@ -288,7 +345,7 @@ def main():
     write_queue = queue.Queue(maxsize=4)  # limita batches pendentes na fila
 
     writer = threading.Thread(
-        target=_thread_escritora, args=(write_queue, db_path), daemon=True
+        target=_thread_escritora, args=(write_queue,), daemon=True
     )
     writer.start()
 
@@ -309,6 +366,4 @@ def main():
     print("Sucesso!")
 
 if __name__ == "__main__":
-    if not os.path.exists("data"):
-        os.makedirs("data")
     main()
