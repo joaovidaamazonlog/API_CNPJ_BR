@@ -42,7 +42,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 # ---------------------------------------------------------------------------
 
 def _get_client():
-    url   = os.environ["TURSO_URL"]
+    url   = os.environ["TURSO_URL"].replace("libsql://", "https://")
     token = os.environ["TURSO_TOKEN"]
     return libsql_client.create_client_sync(url=url, auth_token=token)
 
