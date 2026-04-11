@@ -1,8 +1,21 @@
+"""
+api/main.py
+===========
+API de Prospecção de Parceiros Logísticos.
+
+Rotas
+-----
+GET  /api                        — status
+POST /api/empresas               — busca unificada (Receita Federal + Maps) por CEPs e territory_id
+POST /api/empresas/contactada    — toggle de empresa contactada (qualquer fonte)
+"""
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import libsql_client
 import os
-import libsql
+import asyncio
 
 app = FastAPI()
 
@@ -17,42 +30,32 @@ app.add_middleware(
 # Conexão Turso
 # ---------------------------------------------------------------------------
 
-def get_conn():
-    url = os.environ["TURSO_URL"]
+def _get_client():
+    url   = os.environ["TURSO_URL"]
     token = os.environ["TURSO_TOKEN"]
-    return libsql.connect(":memory:", sync_url=url, auth_token=token)
-
-
-def query(sql: str, params: tuple = ()):
-    conn = get_conn()
-    conn.sync()
-    cur = conn.execute(sql, params)
-    cols = [d[0] for d in cur.description] if cur.description else []
-    rows = cur.fetchall()
-    return [dict(zip(cols, row)) for row in rows]
-
-
-def execute(sql: str, params: tuple = ()):
-    conn = get_conn()
-    conn.sync()
-    conn.execute(sql, params)
-    conn.commit()
-    conn.sync()
-
+    return libsql_client.create_client_sync(url=url, auth_token=token)
 
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
 
-class EmpresasRequest(BaseModel):
-    ceps: list[str] = []
-    territory_ids: list[str] = []
-
+class BuscarEmpresasRequest(BaseModel):
+    ceps:         list[str]
+    territory_id: str | None = None
 
 class ContactadaRequest(BaseModel):
-    cnpj: str
-    contactada: bool
+    lead_key:    str          # link Maps ou "nome|endereço"
+    lead_nome:   str  = ""
+    territorio:  str  = ""
+    fonte:       str  = ""    # "maps" | "receita"
+    action:      str  = "add" # "add" | "remove"
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _limpar_ceps(ceps: list[str]) -> list[str]:
+    return list({c.replace("-", "").strip() for c in ceps if c.strip()})
 
 # ---------------------------------------------------------------------------
 # Rotas
@@ -64,59 +67,105 @@ def status():
 
 
 @app.post("/api/empresas")
-def buscar_empresas(body: EmpresasRequest):
-    ceps = list({c.replace("-", "").strip() for c in body.ceps if c.strip()})
-    territory_ids = list({t.strip() for t in body.territory_ids if t.strip()})
+def buscar_empresas(body: BuscarEmpresasRequest):
+    """
+    Busca unificada: retorna empresas da Receita Federal (por CEP)
+    e do Google Maps (por territory_id), com flag 'contactada' em cada uma.
+    """
+    ceps_limpos = _limpar_ceps(body.ceps)
 
-    if not ceps and not territory_ids:
-        raise HTTPException(status_code=422, detail="Informe ao menos um CEP ou territory_id.")
+    with _get_client() as client:
+        # ── 1. Leads contactados (para aplicar flag) ──────────────────────
+        rs = client.execute("SELECT lead_key FROM leads_contactados")
+        contactadas = {row[0] for row in rs.rows}
 
-    resultados = []
+        # ── 2. Receita Federal — busca por CEP ────────────────────────────
+        receita = []
+        if ceps_limpos:
+            placeholders = ",".join("?" * len(ceps_limpos))
+            rs = client.execute(
+                f"SELECT * FROM empresas_alvo WHERE cep IN ({placeholders})",
+                ceps_limpos,
+            )
+            cols = [d[0] for d in rs.columns] if rs.columns else []
+            for row in rs.rows:
+                emp = dict(zip(cols, row))
+                key = emp.get("cnpj_basico", "") + "|" + emp.get("endereco", "")
+                emp["fonte"]       = "Receita Federal"
+                emp["contactada"]  = key in contactadas or _any_key_match(emp, contactadas)
+                receita.append(emp)
 
-    # Busca em empresas_alvo por CEPs
-    if ceps:
-        ph = ",".join("?" * len(ceps))
-        rows = query(
-            f"SELECT *, 0 AS fonte_gmaps FROM empresas_alvo WHERE cep IN ({ph})",
-            tuple(ceps),
-        )
-        resultados.extend(rows)
+        # ── 3. Google Maps — busca por territory_id ───────────────────────
+        maps = []
+        if body.territory_id:
+            rs = client.execute(
+                "SELECT * FROM gmaps_leads WHERE territory_id = ?",
+                [body.territory_id],
+            )
+            cols = [d[0] for d in rs.columns] if rs.columns else []
+            for row in rs.rows:
+                emp = dict(zip(cols, row))
+                key = emp.get("google_maps_link") or f"{emp.get('nome','')}|{emp.get('endereco','')}"
+                emp["fonte"]      = "Google Maps"
+                emp["contactada"] = key in contactadas
+                maps.append(emp)
 
-    # Busca em gmaps_leads por territory_id
-    if territory_ids:
-        ph = ",".join("?" * len(territory_ids))
-        rows = query(
-            f"SELECT *, 1 AS fonte_gmaps FROM gmaps_leads WHERE territory_id IN ({ph})",
-            tuple(territory_ids),
-        )
-        resultados.extend(rows)
-
-    # Garante campo contactada em todos os registros
-    for r in resultados:
-        r.setdefault("contactada", 0)
-
-    return {"total": len(resultados), "empresas": resultados}
+    empresas = receita + maps
+    return {
+        "total":    len(empresas),
+        "empresas": empresas,
+    }
 
 
 @app.post("/api/empresas/contactada")
 def toggle_contactada(body: ContactadaRequest):
-    cnpj = body.cnpj.strip()
-    if not cnpj:
-        raise HTTPException(status_code=422, detail="CNPJ inválido.")
+    """Toggle de empresa contactada — funciona para Maps e Receita Federal."""
+    if not body.lead_key:
+        raise HTTPException(status_code=422, detail="lead_key é obrigatório")
 
-    val = 1 if body.contactada else 0
+    with _get_client() as client:
+        # Garantir que a tabela existe
+        client.execute("""
+            CREATE TABLE IF NOT EXISTS leads_contactados (
+                lead_key   TEXT PRIMARY KEY,
+                lead_nome  TEXT,
+                territorio TEXT,
+                fonte      TEXT,
+                saved_at   TEXT DEFAULT (datetime('now'))
+            )
+        """)
 
-    # Tenta atualizar em ambas as tabelas
-    execute(
-        "UPDATE empresas_alvo SET contactada = ? WHERE cnpj_basico || cnpj_ordem || cnpj_dv = ?",
-        (val, cnpj),
-    )
-    execute(
-        "UPDATE gmaps_leads SET contactada = ? WHERE cnpj = ?",
-        (val, cnpj),
-    )
+        if body.action == "remove":
+            client.execute(
+                "DELETE FROM leads_contactados WHERE lead_key = ?",
+                [body.lead_key],
+            )
+            return {"ok": True, "action": "removed", "lead_key": body.lead_key}
+        else:
+            client.execute(
+                """
+                INSERT INTO leads_contactados (lead_key, lead_nome, territorio, fonte)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(lead_key) DO UPDATE SET
+                    lead_nome  = excluded.lead_nome,
+                    territorio = excluded.territorio,
+                    fonte      = excluded.fonte,
+                    saved_at   = datetime('now')
+                """,
+                [body.lead_key, body.lead_nome, body.territorio, body.fonte],
+            )
+            return {"ok": True, "action": "saved", "lead_key": body.lead_key}
 
-    return {"ok": True, "cnpj": cnpj, "contactada": body.contactada}
+
+# ---------------------------------------------------------------------------
+# Helper interno
+# ---------------------------------------------------------------------------
+
+def _any_key_match(emp: dict, contactadas: set) -> bool:
+    """Tenta múltiplas chaves possíveis para empresas da Receita Federal."""
+    nome     = emp.get("razao_social", "") or emp.get("nome_fantasia", "")
+    endereco = emp.get("endereco", "")
+    return f"{nome}|{endereco}" in contactadas
 
 
 handler = app

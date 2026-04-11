@@ -1,0 +1,87 @@
+name: Google Maps Scraper
+
+on:
+  schedule:
+    # Batch 1 — 01h BRT (04h UTC): DSP2, DSP4, DSP5, DBR9, DBS5, DPR2, DRS5
+    - cron: '0 4 * * *'
+    # Batch 2 — 04h BRT (07h UTC): DBH5, DMG2, DGO2, DCE3, DES2, DPB3, DPE4
+    - cron: '0 7 * * *'
+    # Batch 3 — 07h BRT (10h UTC): DRJ3, DSA8, XBA1, XCP1, XCS1, XGA2, XPB1
+    - cron: '0 10 * * *'
+    # Batch 4 — 10h BRT (13h UTC): XRJ2, XRJ4, XSJ1, XSP7, XSP9
+    - cron: '0 13 * * *'
+
+  workflow_dispatch:
+    inputs:
+      batch_id:
+        description: 'Batch a rodar (1, 2, 3 ou 4). Deixe vazio para todas.'
+        required: false
+        default: ''
+      stations:
+        description: 'Sobrescrever estações manualmente (ex: DSP2 DBH5).'
+        required: false
+        default: ''
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout repositório
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Instalar dependências
+        working-directory: gmaps_scraper
+        run: npm install
+
+      - name: Resolver estações do batch
+        id: resolve
+        run: |
+          BATCH_1="DSP2 DSP4 DSP5 DBR9 DBS5 DPR2 DRS5"
+          BATCH_2="DBH5 DMG2 DGO2 DCE3 DES2 DPB3 DPE4"
+          BATCH_3="DRJ3 DSA8 XBA1 XCP1 XCS1 XGA2 XPB1"
+          BATCH_4="XRJ2 XRJ4 XSJ1 XSP7 XSP9"
+          HOUR=$(date -u +"%H")
+
+          if [ -n "${{ github.event.inputs.stations }}" ]; then
+            STATIONS="${{ github.event.inputs.stations }}"
+          elif [ -n "${{ github.event.inputs.batch_id }}" ]; then
+            case "${{ github.event.inputs.batch_id }}" in
+              1) STATIONS="$BATCH_1" ;;
+              2) STATIONS="$BATCH_2" ;;
+              3) STATIONS="$BATCH_3" ;;
+              4) STATIONS="$BATCH_4" ;;
+              *) STATIONS="" ;;
+            esac
+          else
+            case "$HOUR" in
+              04) STATIONS="$BATCH_1" ;;
+              07) STATIONS="$BATCH_2" ;;
+              10) STATIONS="$BATCH_3" ;;
+              13) STATIONS="$BATCH_4" ;;
+              *)  STATIONS="" ;;
+            esac
+          fi
+
+          echo "stations=$STATIONS" >> $GITHUB_OUTPUT
+          echo "Estações selecionadas: $STATIONS"
+
+      - name: Rodar scraper
+        working-directory: gmaps_scraper
+        run: |
+          STATIONS="${{ steps.resolve.outputs.stations }}"
+          if [ -n "$STATIONS" ]; then
+            node run_batch.js --stations $STATIONS
+          else
+            node run_batch.js
+          fi
+        env:
+          TURSO_URL:   ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'false'

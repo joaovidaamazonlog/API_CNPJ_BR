@@ -1,0 +1,8 @@
+{
+  "name": "gmaps-scraper",
+  "version": "1.0.0",
+  "dependencies": {
+    "@libsql/client": "^0.6.0",
+    "puppeteer": "^22.0.0"
+  }
+}
