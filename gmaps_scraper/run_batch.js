@@ -1,10 +1,9 @@
 /**
  * run_batch.js
  * ============
- * Scraping do Google Maps — grava resultados no Turso.
- * Usa @tursodatabase/serverless (sem dependências nativas).
- *
- * Busca ideal_supply.json e territories_index.json via GitHub Pages do atlas.
+ * Scraping do Google Maps — grava resultados no Turso via HTTP API.
+ * Usa fetch nativo (Node 20+) para chamar a API HTTP do Turso diretamente,
+ * sem depender de SDK com bugs de migrations.
  *
  * Uso:
  *   node run_batch.js
@@ -12,7 +11,6 @@
  */
 
 const { scrapeGmaps, closeSharedBrowser } = require('./scraper');
-const { createClient } = require('@tursodatabase/serverless');
 
 // ---------------------------------------------------------------------------
 // CONFIGURAÇÃO
@@ -31,22 +29,56 @@ const BATCH_CONCURRENCY = 5;
 const DELAY_MS          = 1000;
 
 // ---------------------------------------------------------------------------
-// TURSO
+// TURSO HTTP CLIENT
 // ---------------------------------------------------------------------------
 
-function getTursoClient() {
-    const url   = process.env.TURSO_URL;
-    const token = process.env.TURSO_TOKEN;
-    if (!url || !token) {
-        console.error('TURSO_URL e TURSO_TOKEN são obrigatórios');
-        process.exit(1);
-    }
-    return createClient({ url, authToken: token });
+const TURSO_URL   = process.env.TURSO_URL;
+const TURSO_TOKEN = process.env.TURSO_TOKEN;
+
+if (!TURSO_URL || !TURSO_TOKEN) {
+    console.error('TURSO_URL e TURSO_TOKEN são obrigatórios');
+    process.exit(1);
 }
 
-async function ensureTable(client) {
-    await client.execute(`
-        CREATE TABLE IF NOT EXISTS gmaps_leads (
+// Converte libsql:// para https://
+const TURSO_HTTP_URL = TURSO_URL.replace(/^libsql:\/\//, 'https://');
+
+/**
+ * Executa uma ou mais statements no Turso via HTTP API.
+ * @param {Array<{sql: string, args: any[]}>} statements
+ */
+async function tursoExecute(statements) {
+    const res = await fetch(`${TURSO_HTTP_URL}/v2/pipeline`, {
+        method:  'POST',
+        headers: {
+            'Authorization': `Bearer ${TURSO_TOKEN}`,
+            'Content-Type':  'application/json',
+        },
+        body: JSON.stringify({
+            requests: statements.map(s => ({
+                type:  'execute',
+                stmt:  {
+                    sql:  s.sql,
+                    args: (s.args || []).map(v => {
+                        if (v === null || v === undefined) return { type: 'null' };
+                        if (typeof v === 'number')         return { type: 'float', value: v };
+                        return { type: 'text', value: String(v) };
+                    }),
+                },
+            })),
+        }),
+    });
+
+    if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Turso HTTP ${res.status}: ${text}`);
+    }
+    return res.json();
+}
+
+async function ensureTable() {
+    await tursoExecute([{
+        sql: `CREATE TABLE IF NOT EXISTS gmaps_leads (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
             nome             TEXT,
             endereco         TEXT,
@@ -60,13 +92,14 @@ async function ensureTable(client) {
             station_code     TEXT,
             cep              TEXT,
             updated_at       TEXT DEFAULT (datetime('now'))
-        )
-    `);
+        )`,
+        args: [],
+    }]);
 }
 
-async function upsertLead(client, item) {
+async function upsertLead(item) {
     if (item.google_maps_link && item.google_maps_link !== 'N/A') {
-        await client.execute({
+        await tursoExecute([{
             sql: `INSERT INTO gmaps_leads
                     (nome, endereco, telefone, site, google_maps_link, lat, lon, tipo, territory_id, station_code, cep, updated_at)
                   VALUES (?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
@@ -83,9 +116,9 @@ async function upsertLead(client, item) {
                 item.google_maps_link, item.lat, item.lon,
                 item.tipo, item.territory_id, item.station_code, item.cep,
             ],
-        });
+        }]);
     } else {
-        await client.execute({
+        await tursoExecute([{
             sql: `INSERT OR IGNORE INTO gmaps_leads
                     (nome, endereco, telefone, site, google_maps_link, lat, lon, tipo, territory_id, station_code, cep)
                   VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
@@ -94,7 +127,7 @@ async function upsertLead(client, item) {
                 item.google_maps_link, item.lat, item.lon,
                 item.tipo, item.territory_id, item.station_code, item.cep,
             ],
-        });
+        }]);
     }
 }
 
@@ -168,8 +201,7 @@ async function main() {
     console.log(`  Territórios: ${openTerritories.size} | Tipos: ${BUSINESS_TYPES.length} | Total buscas: ${total}`);
     console.log(`${'='.repeat(60)}\n`);
 
-    const client = getTursoClient();
-    await ensureTable(client);
+    await ensureTable();
 
     const tasks = [];
     for (const tid of openTerritories) {
@@ -187,7 +219,7 @@ async function main() {
         try {
             const items = await scrapeGmaps(type, String(meta.centroid_lat), String(meta.centroid_lon));
             for (const item of items) {
-                await upsertLead(client, {
+                await upsertLead({
                     nome:             item.name    || 'N/A',
                     endereco:         item.address || 'N/A',
                     telefone:         item.phone   || 'N/A',
@@ -210,7 +242,6 @@ async function main() {
     });
 
     await closeSharedBrowser();
-    client.close();
 
     console.log(`\n${'='.repeat(60)}`);
     console.log(`  CONCLUÍDO — dados gravados no Turso`);

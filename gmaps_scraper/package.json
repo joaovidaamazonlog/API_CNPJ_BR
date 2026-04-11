@@ -2,7 +2,6 @@
   "name": "gmaps-scraper",
   "version": "1.0.0",
   "dependencies": {
-    "@tursodatabase/serverless": "^0.1.0",
     "puppeteer": "^22.0.0"
   }
 }
