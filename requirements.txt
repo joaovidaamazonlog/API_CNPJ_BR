@@ -3,4 +3,4 @@ uvicorn
 pydantic
 requests
 polars==1.19.0
-libsql-client
+httpx
