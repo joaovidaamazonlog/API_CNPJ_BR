@@ -28,10 +28,10 @@ jobs:
           cache: 'pip'
 
       - name: Instalar dependências
-        run: pip install -r _api_backend/requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Executar ETL → Turso
-        run: python _api_backend/etl_cnpj.py
+        run: python etl_cnpj.py
         env:
           TURSO_URL:   ${{ secrets.TURSO_URL }}
           TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
