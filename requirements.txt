@@ -1,6 +1,1 @@
-fastapi
-uvicorn
-pydantic
-requests
-polars==1.19.0
-httpx
+requests>=2.31.0

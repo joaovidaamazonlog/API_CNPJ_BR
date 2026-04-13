@@ -10,7 +10,6 @@ Variáveis de ambiente necessárias:
 """
 
 import requests
-import polars as pl
 import zipfile
 import io
 import csv
@@ -20,15 +19,33 @@ import tempfile
 import time
 import threading
 import queue
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import libsql_client
 
 # =============================================================================
 # Configurações de Filtro
 # =============================================================================
-CNAE_ALVO     = "5320"       # Transporte rodoviário de encomendas
+# Prefixos de CNAE aceitos (4 dígitos — match por startswith)
+CNAES_ALVO = {
+    "5320",  # Transporte rodoviário de encomendas
+    "5611",  # Restaurantes e similares
+    "9521",  # Reparação de equipamentos eletroeletrônicos
+    "9512",  # Reparação de equipamentos de informática
+    "9511",  # Reparação de computadores e periféricos
+    "4635",  # Comércio atacadista de bebidas
+    "4784",  # Comércio varejista de artigos de caça, pesca e camping
+    "4723",  # Comércio varejista de bebidas
+    "9602",  # Cabeleireiros, manicure e pedicure
+    "4724",  # Comércio varejista de hortifrutigranjeiros
+    "9529",  # Reparação e manutenção de outros objetos pessoais
+    "4530",  # Comércio de peças e acessórios para veículos
+}
+
 SITUACAO_ATIVA = "02"        # 02 = Ativa
 PORTES_ALVO   = {"00", "01"} # 00 = Não informado, 01 = Micro Empresa
+
+# Estados de interesse
+UFS_ALVO = {"CE", "PE", "PB", "BA", "DF", "GO", "MG", "ES", "RJ", "SP", "PR", "AM", "SC", "RS"}
 
 NEXTCLOUD_BASE = "https://arquivos.receitafederal.gov.br"
 CNPJ_PATH      = "Dados/Cadastros/CNPJ"
@@ -48,13 +65,55 @@ PROPFIND_BODY = '''<?xml version="1.0" encoding="utf-8" ?>
 <d:propfind xmlns:d="DAV:"><d:prop><d:displayname/></d:prop></d:propfind>'''
 
 # =============================================================================
-# Conexão Turso
+# Conexão Turso via HTTP (mais estável que libsql_client WebSocket)
 # =============================================================================
 
-def _get_turso_client():
-    return libsql_client.create_client_sync(
+class TursoClient:
+    """Cliente HTTP simples para Turso/libsql."""
+
+    def __init__(self, url: str, token: str):
+        # Converte libsql:// → https://
+        self.base_url = url.replace("libsql://", "https://") + "/v2/pipeline"
+        self.headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+    def _post(self, requests_payload: list) -> list:
+        body = {"requests": requests_payload}
+        r = requests.post(self.base_url, headers=self.headers, json=body, timeout=30)
+        r.raise_for_status()
+        return r.json()["results"]
+
+    def execute(self, sql: str, params: list = None):
+        req = {"type": "execute", "stmt": {"sql": sql}}
+        if params:
+            req["stmt"]["args"] = [{"type": "text", "value": str(p)} for p in params]
+        results = self._post([req, {"type": "close"}])
+        return results[0]
+
+    def batch(self, statements: list[tuple]):
+        """statements: lista de (sql, params)"""
+        reqs = []
+        for sql, params in statements:
+            req = {"type": "execute", "stmt": {"sql": sql}}
+            if params:
+                req["stmt"]["args"] = [
+                    {"type": "null"} if p is None else {"type": "text", "value": str(p)}
+                    for p in params
+                ]
+            reqs.append(req)
+        reqs.append({"type": "close"})
+        self._post(reqs)
+
+    def close(self):
+        pass  # HTTP é stateless, nada a fechar
+
+
+def _get_turso_client() -> TursoClient:
+    return TursoClient(
         url=os.environ["TURSO_URL"],
-        auth_token=os.environ["TURSO_TOKEN"],
+        token=os.environ["TURSO_TOKEN"],
     )
 
 # =============================================================================
@@ -62,9 +121,14 @@ def _get_turso_client():
 # =============================================================================
 
 def obter_token_raiz():
-    r = requests.get(NEXTCLOUD_BASE, headers=HEADERS, timeout=15)
+    r = requests.get(NEXTCLOUD_BASE, headers=HEADERS, timeout=15, allow_redirects=True)
     r.raise_for_status()
-    match = re.search(r'og:url.*?/s/([A-Za-z0-9]{10,25})', r.text)
+    # Tenta extrair token da URL final (após redirect) ou do HTML
+    match = re.search(r'/s/([A-Za-z0-9]{10,25})', r.url)
+    if not match:
+        match = re.search(r'og:url.*?/s/([A-Za-z0-9]{10,25})', r.text)
+    if not match:
+        match = re.search(r'/s/([A-Za-z0-9]{10,25})', r.text)
     if match:
         token = match.group(1)
         print(f"Token raiz encontrado: {token}")
@@ -134,14 +198,30 @@ def filtrar_empresas(token, period, num_parte):
 def filtrar_estabelecimentos(token, period, num_parte):
     rows = []
     for row in stream_csv_do_zip(token, period, "Estabelecimentos", num_parte):
-        if len(row) < 28: continue
+        if len(row) < 30: continue
         situacao = row[5].strip()
+        uf       = row[19].strip()
         cnae_pri = row[11].strip()
         cnae_sec = row[12].strip()
         if situacao != SITUACAO_ATIVA: continue
-        if not (cnae_pri.startswith(CNAE_ALVO) or CNAE_ALVO in cnae_sec): continue
+        if uf not in UFS_ALVO: continue
+        # Aceita se CNAE principal ou algum secundário começa com qualquer prefixo alvo
+        cnae_match = any(cnae_pri.startswith(c) for c in CNAES_ALVO)
+        if not cnae_match:
+            cnae_match = any(
+                sec.startswith(c)
+                for sec in cnae_sec.split(",")
+                for c in CNAES_ALVO
+            )
+        if not cnae_match: continue
+        # Telefones: 3 pares DDD+número nos índices 21-26
         ddd1, tel1 = row[21].strip(), row[22].strip()
         ddd2, tel2 = row[23].strip(), row[24].strip()
+        ddd3, tel3 = row[25].strip(), row[26].strip()
+        fones = [
+            (ddd + tel) for ddd, tel in [(ddd1, tel1), (ddd2, tel2), (ddd3, tel3)]
+            if ddd or tel
+        ]
         rows.append({
             "cnpj_basico":    row[0].strip(),
             "cnpj_ordem":     row[1].strip(),
@@ -154,8 +234,8 @@ def filtrar_estabelecimentos(token, period, num_parte):
             "cep":       row[18].strip(),
             "uf":        row[19].strip(),
             "municipio": row[20].strip(),
-            "telefone_1": (ddd1 + tel1) if (ddd1 or tel1) else "",
-            "telefone_2": (ddd2 + tel2) if (ddd2 or tel2) else "",
+            "telefone_1": fones[0] if len(fones) > 0 else "",
+            "telefone_2": fones[1] if len(fones) > 1 else "",
             "email":     row[27].strip(),
         })
     return rows
@@ -185,10 +265,9 @@ def _processar_parte_estab(token, period, empresas, i, write_queue):
 def _thread_escritora(write_queue):
     """Consome a fila e insere em batches no Turso."""
     client = _get_turso_client()
-    tabela_criada = False
     total = 0
 
-    # Criar tabela se não existir
+    # Criar tabela e limpar dados antigos
     client.execute("""
         CREATE TABLE IF NOT EXISTS empresas_alvo (
             cnpj_basico TEXT, cnpj_ordem TEXT, cnpj_dv TEXT,
@@ -198,6 +277,7 @@ def _thread_escritora(write_queue):
             telefone_1 TEXT, telefone_2 TEXT, email TEXT
         )
     """)
+    client.execute("DELETE FROM empresas_alvo")
 
     if not tabela_criada:
         # Limpar dados antigos antes de inserir novos
@@ -215,7 +295,7 @@ def _thread_escritora(write_queue):
             chunk = batch[i:i + chunk_size]
             stmts = []
             for r in chunk:
-                stmts.append(libsql_client.Statement(
+                stmts.append((
                     """INSERT INTO empresas_alvo
                        (cnpj_basico, cnpj_ordem, cnpj_dv, razao_social, nome_fantasia, porte,
                         cnae_principal, cnae_secundaria, endereco, bairro, cep, uf, municipio,
