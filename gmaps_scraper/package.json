@@ -1,7 +1,14 @@
 {
-  "name": "gmaps-scraper",
+  "name": "atlas-gmaps-scraper",
   "version": "1.0.0",
+  "description": "Google Maps scraper for ATLAS — writes leads to Turso",
+  "main": "run_batch.js",
+  "scripts": {
+    "start": "node run_batch.js",
+    "backfill-h3": "node backfill_h3.js"
+  },
   "dependencies": {
-    "puppeteer": "^22.0.0"
+    "h3-js": "^4.1.0",
+    "puppeteer": "^24.15.0"
   }
 }

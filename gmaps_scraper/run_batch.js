@@ -10,6 +10,11 @@
 
 const { scrapeGmaps, closeSharedBrowser } = require('./scraper');
 
+const { latLngToCell } = require('h3-js');
+
+// ---------------------------------------------------------------------------
+// TURSO HTTP
+
 const BUSINESS_TYPES = [
     'lanchonete',
     'açaí e sorveteria',
@@ -75,6 +80,8 @@ async function ensureTable() {
             google_maps_link TEXT UNIQUE,
             lat              REAL,
             lon              REAL,
+            h3_r8_id         TEXT,
+            h3_r9_id         TEXT,
             tipo             TEXT,
             territory_id     TEXT,
             station_code     TEXT,
@@ -82,33 +89,46 @@ async function ensureTable() {
             updated_at       TEXT DEFAULT (datetime('now'))
         )
     `);
+    // Migração: adiciona colunas se a tabela já existia sem elas
+    for (const col of ['h3_r8_id', 'h3_r9_id']) {
+        try {
+            await tursoExecute(`ALTER TABLE gmaps_leads ADD COLUMN ${col} TEXT`);
+        } catch (_) { /* já existe */ }
+    }
+    await tursoExecute(`CREATE INDEX IF NOT EXISTS idx_gmaps_leads_h3_r8 ON gmaps_leads (h3_r8_id)`);
+    await tursoExecute(`CREATE INDEX IF NOT EXISTS idx_gmaps_leads_h3_r9 ON gmaps_leads (h3_r9_id)`);
 }
 
 async function upsertLead(item) {
+    const h3r8 = latLonToH3(item.lat, item.lon, 8);
+    const h3r9 = latLonToH3(item.lat, item.lon, 9);
+
     if (item.google_maps_link && item.google_maps_link !== 'N/A') {
         await tursoExecute(
             `INSERT INTO gmaps_leads
-                (nome, endereco, telefone, site, google_maps_link, lat, lon, tipo, territory_id, station_code, cep, updated_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+                (nome, endereco, telefone, site, google_maps_link, lat, lon, h3_r8_id, h3_r9_id, tipo, territory_id, station_code, cep, updated_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
              ON CONFLICT(google_maps_link) DO UPDATE SET
                 nome       = excluded.nome,
                 endereco   = CASE WHEN excluded.endereco != 'N/A' THEN excluded.endereco ELSE gmaps_leads.endereco END,
                 telefone   = excluded.telefone,
                 lat        = excluded.lat,
                 lon        = excluded.lon,
+                h3_r8_id   = excluded.h3_r8_id,
+                h3_r9_id   = excluded.h3_r9_id,
                 cep        = excluded.cep,
                 updated_at = datetime('now')`,
             [item.nome, item.endereco, item.telefone, item.site,
-             item.google_maps_link, item.lat, item.lon,
+             item.google_maps_link, item.lat, item.lon, h3r8, h3r9,
              item.tipo, item.territory_id, item.station_code, item.cep]
         );
     } else {
         await tursoExecute(
             `INSERT OR IGNORE INTO gmaps_leads
-                (nome, endereco, telefone, site, google_maps_link, lat, lon, tipo, territory_id, station_code, cep)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+                (nome, endereco, telefone, site, google_maps_link, lat, lon, h3_r8_id, h3_r9_id, tipo, territory_id, station_code, cep)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
             [item.nome, item.endereco, item.telefone, item.site,
-             item.google_maps_link, item.lat, item.lon,
+             item.google_maps_link, item.lat, item.lon, h3r8, h3r9,
              item.tipo, item.territory_id, item.station_code, item.cep]
         );
     }
@@ -136,6 +156,15 @@ function parseStationsArg() {
 function extractCep(address) {
     const match = (address || '').match(/\b(\d{5})-?(\d{3})\b/);
     return match ? match[1] + match[2] : null;
+}
+
+function latLonToH3(lat, lon, res) {
+    if (lat == null || lon == null) return null;
+    try {
+        return latLngToCell(lat, lon, res);
+    } catch (_) {
+        return null;
+    }
 }
 
 async function fetchJson(url) {
