@@ -48,7 +48,7 @@ def _arg(v):
         return {"type": "float", "value": v}
     return {"type": "text", "value": str(v)}
 
-def turso_execute(sql: str, args: list = []) -> list[dict]:
+async def turso_execute(sql: str, args: list = []) -> list[dict]:
     """Executa uma query no Turso e retorna lista de dicts. Retorna [] em caso de erro."""
     payload = {
         "requests": [
@@ -57,8 +57,8 @@ def turso_execute(sql: str, args: list = []) -> list[dict]:
         ]
     }
 
-    with httpx.Client(timeout=15) as client:
-        res = client.post(
+    async with httpx.AsyncClient(timeout=60) as client:
+        res = await client.post(
             f"{_turso_url()}/v2/pipeline",
             json=payload,
             headers={
@@ -163,14 +163,14 @@ def _build_disk_union(slots: list[SlotRef]) -> tuple[dict[str, str], dict[str, s
 # ---------------------------------------------------------------------------
 
 @app.get("/api")
-def status():
+async def status():
     return {"status": "API de Prospecção Ativa", "versao": "2.0"}
 
 
 @app.post("/api/empresas")
-def buscar_empresas(body: BuscarEmpresasRequest):
+async def buscar_empresas(body: BuscarEmpresasRequest):
     # Leads contactados
-    rows        = turso_execute("SELECT lead_key FROM leads_contactados")
+    rows        = await turso_execute("SELECT lead_key FROM leads_contactados")
     contactadas = {r["lead_key"] for r in rows}
 
     # Constrói a união dos grid_disk(1) de todos os slots vagos
@@ -184,7 +184,7 @@ def buscar_empresas(body: BuscarEmpresasRequest):
 
     if use_r9:
         placeholders = ",".join("?" * len(hex_r9_to_slot))
-        rows = turso_execute(
+        rows = await turso_execute(
             f"SELECT * FROM empresas_geo WHERE h3_r9_id IN ({placeholders})",
             list(hex_r9_to_slot),
         )
@@ -203,7 +203,7 @@ def buscar_empresas(body: BuscarEmpresasRequest):
 
     elif use_r8:
         placeholders = ",".join("?" * len(hex_r8_to_slot))
-        rows = turso_execute(
+        rows = await turso_execute(
             f"SELECT * FROM empresas_geo WHERE h3_r8_id IN ({placeholders})",
             list(hex_r8_to_slot),
         )
@@ -223,7 +223,7 @@ def buscar_empresas(body: BuscarEmpresasRequest):
         # fallback legado — sem h3 nos slots
         ceps_limpos = _limpar_ceps(body.ceps)
         placeholders = ",".join("?" * len(ceps_limpos))
-        rows = turso_execute(
+        rows = await turso_execute(
             f"SELECT * FROM empresas_alvo WHERE cep IN ({placeholders})",
             ceps_limpos,
         )
@@ -240,7 +240,7 @@ def buscar_empresas(body: BuscarEmpresasRequest):
 
     if use_r9:
         placeholders = ",".join("?" * len(hex_r9_to_slot))
-        rows = turso_execute(
+        rows = await turso_execute(
             f"SELECT * FROM gmaps_leads WHERE h3_r9_id IN ({placeholders})",
             list(hex_r9_to_slot),
         )
@@ -253,7 +253,7 @@ def buscar_empresas(body: BuscarEmpresasRequest):
 
     elif use_r8:
         placeholders = ",".join("?" * len(hex_r8_to_slot))
-        rows = turso_execute(
+        rows = await turso_execute(
             f"SELECT * FROM gmaps_leads WHERE h3_r8_id IN ({placeholders})",
             list(hex_r8_to_slot),
         )
@@ -266,7 +266,7 @@ def buscar_empresas(body: BuscarEmpresasRequest):
 
     elif body.territory_id:
         # fallback legado
-        rows = turso_execute(
+        rows = await turso_execute(
             "SELECT * FROM gmaps_leads WHERE territory_id = ?",
             [body.territory_id],
         )
@@ -282,12 +282,12 @@ def buscar_empresas(body: BuscarEmpresasRequest):
 
 
 @app.post("/api/empresas/contactada")
-def toggle_contactada(body: ContactadaRequest):
+async def toggle_contactada(body: ContactadaRequest):
     if not body.lead_key:
         raise HTTPException(status_code=422, detail="lead_key é obrigatório")
 
     # Criar tabela se não existir
-    turso_execute("""
+    await turso_execute("""
         CREATE TABLE IF NOT EXISTS leads_contactados (
             lead_key   TEXT PRIMARY KEY,
             lead_nome  TEXT,
@@ -298,13 +298,13 @@ def toggle_contactada(body: ContactadaRequest):
     """)
 
     if body.action == "remove":
-        turso_execute(
+        await turso_execute(
             "DELETE FROM leads_contactados WHERE lead_key = ?",
             [body.lead_key],
         )
         return {"ok": True, "action": "removed"}
 
-    turso_execute(
+    await turso_execute(
         """INSERT INTO leads_contactados (lead_key, lead_nome, territorio, fonte)
            VALUES (?, ?, ?, ?)
            ON CONFLICT(lead_key) DO UPDATE SET
