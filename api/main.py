@@ -114,10 +114,12 @@ class ContactadaRequest(BaseModel):
     action:     str = "add"
 
 class PartnerRecord(BaseModel):
+    # Campos diretos do Schema_Limpo (Partner.to_dict)
     salesforce_id:           str
     store_id:                str | None = None
     name:                    str = ""
     status:                  str = ""
+    lead_source:             str | None = None
     lat:                     float | None = None
     lon:                     float | None = None
     zip_code:                str | None = None
@@ -125,10 +127,9 @@ class PartnerRecord(BaseModel):
     state:                   str | None = None
     delivery_station:        str = ""
     supply_run:              str | None = None
-    radius:                  float | None = None
-    capacity:                int | None = None
+    radius:                  int = 1500
+    capacity:                int = 42
     bucket:                  str | None = None
-    bucket_ade:              str | None = None
     jurisdiction_type:       str | None = None
     hub_delivey_initiatives: str | None = None
     HCP_rate_card:           str | None = None
@@ -138,12 +139,8 @@ class PartnerRecord(BaseModel):
     telefone:                str | None = None
     owner_id:                str | None = None
     decision_status:         str | None = None
-    lead_source:             str | None = None
-    regiao:                  str | None = None
-    decision:                str | None = None
-    reason:                  str | None = None
-    radius_suggestion:       float | None = None
-    cap_suggestion:          int | None = None
+    decision_reason_code:    str | None = None
+    tooltip:                 str = ""
 
 class UpsertPartnersRequest(BaseModel):
     partners: list[PartnerRecord]
@@ -395,6 +392,7 @@ CREATE TABLE IF NOT EXISTS partners (
     store_id                 TEXT,
     name                     TEXT,
     status                   TEXT,
+    lead_source              TEXT,
     lat                      REAL,
     lon                      REAL,
     zip_code                 TEXT,
@@ -402,10 +400,9 @@ CREATE TABLE IF NOT EXISTS partners (
     state                    TEXT,
     delivery_station         TEXT,
     supply_run               TEXT,
-    radius                   REAL,
+    radius                   INTEGER,
     capacity                 INTEGER,
     bucket                   TEXT,
-    bucket_ade               TEXT,
     jurisdiction_type        TEXT,
     hub_delivey_initiatives  TEXT,
     HCP_rate_card            TEXT,
@@ -415,24 +412,21 @@ CREATE TABLE IF NOT EXISTS partners (
     telefone                 TEXT,
     owner_id                 TEXT,
     decision_status          TEXT,
-    lead_source              TEXT,
-    regiao                   TEXT,
-    decision                 TEXT,
-    reason                   TEXT,
-    radius_suggestion        REAL,
-    cap_suggestion           INTEGER,
+    decision_reason_code     TEXT,
+    tooltip                  TEXT,
     updated_at               TEXT DEFAULT (datetime('now'))
 )
 """
 
 UPSERT_SQL = """
 INSERT OR REPLACE INTO partners (
-    salesforce_id, store_id, name, status, lat, lon, zip_code, city, state,
-    delivery_station, supply_run, radius, capacity, bucket, bucket_ade,
+    salesforce_id, store_id, name, status, lead_source,
+    lat, lon, zip_code, city, state,
+    delivery_station, supply_run, radius, capacity, bucket,
     jurisdiction_type, hub_delivey_initiatives, HCP_rate_card, HCP_host_partner,
-    launch_date, exited_date, telefone, owner_id, decision_status, lead_source,
-    regiao, decision, reason, radius_suggestion, cap_suggestion, updated_at
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+    launch_date, exited_date, telefone, owner_id,
+    decision_status, decision_reason_code, tooltip, updated_at
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
 """
 
 def _turso_pipeline(requests_payload: list) -> dict:
@@ -468,14 +462,13 @@ def upsert_partners(body: UpsertPartnersRequest):
                 "stmt": {
                     "sql": UPSERT_SQL,
                     "args": [_arg(v) for v in [
-                        p.salesforce_id, p.store_id, p.name, p.status,
+                        p.salesforce_id, p.store_id, p.name, p.status, p.lead_source,
                         p.lat, p.lon, p.zip_code, p.city, p.state,
                         p.delivery_station, p.supply_run, p.radius, p.capacity,
-                        p.bucket, p.bucket_ade, p.jurisdiction_type,
-                        p.hub_delivey_initiatives, p.HCP_rate_card, p.HCP_host_partner,
+                        p.bucket, p.jurisdiction_type, p.hub_delivey_initiatives,
+                        p.HCP_rate_card, p.HCP_host_partner,
                         p.launch_date, p.exited_date, p.telefone, p.owner_id,
-                        p.decision_status, p.lead_source, p.regiao,
-                        p.decision, p.reason, p.radius_suggestion, p.cap_suggestion,
+                        p.decision_status, p.decision_reason_code, p.tooltip,
                     ]],
                 },
             }
